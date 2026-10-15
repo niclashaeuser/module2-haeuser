@@ -1,0 +1,15 @@
+*.log
+*_files/
+.DS_Store
+.RData
+.Rhistory
+.Rproj.user/
+module2.html
+module2_files/
+slides.tex
+slides_files/
+data/corpus/
+
+# lecture slides (kept out of the student repo)
+slides/
+_to_delete/

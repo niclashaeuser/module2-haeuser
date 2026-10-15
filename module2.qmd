@@ -1,0 +1,445 @@
+---
+title: "Can an LLM read climate policy? An annotation lab"
+format: html
+---
+
+## The question
+
+> **Do national climate laws and policies commit to concrete, measurable targets, and does this
+> differ between countries and regions?**
+
+Answering this properly would mean reading thousands of documents in dozens of languages. Today we ask the question: **if we let a model do the reading,
+would we trust the answer?** At each step, notice how the answer to the big question could change
+depending on who or what does the coding, which model we use, how we define "target", and what the
+model assumes about countries.
+
+::: {.callout-important}
+## This is a methods exercise, not a study
+
+We use a dataset that Climate Policy Radar built to train an ML classifier: a few thousand policy
+passages labelled by their experts. It is **not** a representative sample of national policies, so
+nothing we compute today tells us which countries have targets or how ambitious they are. What it
+does give us is expert labels to check ourselves and the models against.
+:::
+
+### About the data
+
+- **Source:** [Climate Policy Radar, national-climate-targets](https://huggingface.co/datasets/ClimatePolicyRadar/national-climate-targets)
+  (CC-BY 4.0; Juhasz et al. 2024). 2,610 passages from national climate laws, policies and UNFCCC
+  submissions in Climate Policy Radar's database.
+- **Labels:** each passage was coded by domain experts as containing a net-zero target, an emissions
+  reduction target, another kind of target, or none. A target is "an aim to achieve a specific
+  outcome, that is quantifiable and is given a deadline."
+- **How passages were chosen:** these passages were chosen to train a model, not to represent countries. Passages likely to
+  contain targets were deliberately included, and extra non-target passages were added.
+- **Translation:** many passages were machine-translated into English (Google Translate) before
+  the experts read them. The `translated` column tells you which.
+- **Our sample:** 100 passages, half with a target and half without, chosen by us so the comparison
+  is informative.
+
+Work through the sections at your own pace. Run each chunk in order with the green ▶ button, Sections 7 and 8 are optional.
+
+## 0. Setup
+
+This chunk loads the packages and data and defines `ask_model()`, the one function that talks
+to the language models. The models run inside Ollama on your own laptop; R sends them a prompt over
+a local connection (`localhost`) and gets text back. Nothing leaves your computer.
+
+```{r setup}
+library(dplyr)      # data manipulation: filter, mutate, summarise, ...
+library(jsonlite)   # reading and writing JSON, the format the models reply in
+library(ggplot2)    # plots
+
+# The 100 passages we'll work with today, one row each. Columns: id, text, country, region,
+# translated (TRUE if machine-translated into English), expert_target (1 = the experts found a
+# target, 0 = not) and expert_type (which kind of target).
+passages <- readr::read_csv("data/sample.csv", show_col_types = FALSE)
+
+# Two small open-weights models (about 3 billion parameters each), from Meta and Alibaba.
+MODELS <- c("llama3.2:3b", "qwen2.5:3b")
+
+# Send one prompt to a model running in Ollama on this laptop; return its text reply.
+#  - format = "json" asks the model to reply in JSON, which is easier to read automatically
+#  - temperature = 0 makes it pick its most likely answer instead of sampling, and the fixed
+#    seed makes runs as repeatable as possible
+ask_model <- function(model, prompt) {
+  body <- toJSON(list(model = model, prompt = prompt, stream = FALSE, format = "json",
+                      options = list(temperature = 0, seed = 42)), auto_unbox = TRUE)
+  h <- curl::new_handle(post = TRUE, postfields = as.character(body), timeout = 120)
+  curl::handle_setheaders(h, "Content-Type" = "application/json")
+  res <- tryCatch(curl::curl_fetch_memory("http://localhost:11434/api/generate", handle = h),
+                  error = \(e) stop("Can't reach Ollama. Open the Ollama app and try again.", call. = FALSE))
+  out <- fromJSON(rawToChar(res$content))
+  if (!is.null(out$error)) stop(out$error, ". Did you run `ollama pull ", model, "`?", call. = FALSE)
+  out$response
+}
+
+# Quick check that Ollama is running. You should see a short JSON reply.
+ask_model(MODELS[1], 'Reply with the JSON {"ok": 1}')
+```
+
+## 1. The coding scheme
+
+This is the definition the experts used. The models get exactly this text.
+
+`make_prompt()` wraps each passage in the same instructions, and `read_label()` pulls the 0 or 1
+out of the model's reply. Small models don't always follow instructions, so if the reply has no
+usable answer we record `NA` (missing) rather than guessing.
+
+```{r codebook}
+# The coding scheme, in words. This text is the only thing that tells the model what a "target" is.
+DEFINITION <- "A TARGET is an aim to achieve a specific outcome that is quantifiable and has a
+deadline. Examples: cut emissions 40% by 2030; 50% renewable electricity by 2035; net zero by 2050.
+A general aim without a number or a date is NOT a target."
+
+# Build the full prompt for one passage: role, definition, question, required answer format, passage.
+make_prompt <- function(text, definition = DEFINITION) {
+  paste0("You are coding passages from national climate laws and policies.\n\n",
+         definition, "\n\n",
+         "Does the passage below contain a target? Respond with JSON only: ",
+         '{"target": 1} or {"target": 0}.\n\nPassage:\n', text)
+}
+
+# Pull the 0/1 out of the model's reply (NA if it didn't follow instructions).
+# The pattern looks for "target", a colon, optional spaces and quotes, then a 0 or 1.
+read_label <- function(reply) {
+  x <- regmatches(reply, regexpr('"target"\\s*:\\s*"?[01]', reply))
+  if (length(x) == 0) NA_integer_ else as.integer(substring(x, nchar(x)))
+}
+```
+
+## 2. Code 10 passages yourself
+
+Read each passage and decide: target (1) or no target (0)? Don't look anything up.
+
+```{r show-passages}
+#| results: asis
+# Print the first 10 passages. (results: asis lets the bold numbering show as formatting.)
+for (i in 1:10) cat("**", i, ".** ", passages$text[i], "\n\n", sep = "")
+```
+
+Type your answers, in order, then run the chunk.
+
+```{r my-labels}
+my_labels <- c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA)   # replace each NA with 1 or 0
+```
+
+## 3. Run the two models
+
+This sends every passage to each model, one at a time, and collects the answers. It takes a few
+minutes. If you change the definition or prompt in section 1, rerun this chunk to see the effect.
+
+```{r run-models}
+# Ask each model about each passage. sapply() loops over the passages and collects one
+# 0/1/NA per passage.
+model_labels <- passages |> select(id)
+for (m in MODELS) {
+  message("Running ", m, " ...")
+  model_labels[[m]] <- sapply(passages$text, \(t) read_label(ask_model(m, make_prompt(t))))
+}
+
+# Put the passages, expert labels and model labels side by side in one table.
+results <- passages |> left_join(model_labels, by = "id")
+```
+
+## 4. How well do they agree?
+
+Percentage agreement flatters: if most passages had no target, saying "no" every time would score
+well. **Cohen's kappa** corrects for agreement you would get by chance (0 = chance, 1 = perfect).
+
+```{r agreement}
+# Cohen's kappa for two coders who each gave 0/1 labels to the same passages.
+kappa <- function(a, b) {
+  # Only compare passages where both coders gave an answer
+  ok <- !is.na(a) & !is.na(b); a <- a[ok]; b <- b[ok]
+  # How often they actually agree
+  p_observed <- mean(a == b)
+  # How often they would agree by chance, given how often each says 1:
+  # both say 1 by chance, plus both say 0 by chance
+  p_chance <- mean(a) * mean(b) + (1 - mean(a)) * (1 - mean(b))
+  # Agreement beyond chance, scaled so that 1 = perfect and 0 = no better than chance
+  (p_observed - p_chance) / (1 - p_chance)
+}
+
+# Everyone we want to compare: the experts, you, and the two models.
+# The names are what's printed; the values are the column names in `results`.
+coders <- c("Experts" = "expert_target", "You (first 10)" = "me", setNames(MODELS, MODELS))
+# Your labels cover only the first 10 passages; the rest are NA.
+results$me <- c(my_labels, rep(NA, nrow(results) - 10))
+
+# One row per coder:
+#  - passages: how many passages they labelled
+#  - targets_found: how many they said contain a target
+#  - agree_with_experts: share of passages where they gave the same label as the experts
+#  - kappa_vs_experts: agreement beyond chance
+tibble(
+  coder = names(coders),
+  passages = sapply(coders, \(c) sum(!is.na(results[[c]]))),
+  targets_found = sapply(coders, \(c) sum(results[[c]], na.rm = TRUE)),
+  agree_with_experts = sapply(coders, \(c) mean(results[[c]] == results$expert_target, na.rm = TRUE)),
+  kappa_vs_experts = sapply(coders, \(c) kappa(results[[c]], results$expert_target))
+) |> mutate(across(where(is.double), \(x) round(x, 2)))
+```
+
+```{r models-vs-each-other}
+# Do the two models agree with each other? (Two models can agree well and both be wrong.)
+round(kappa(results[[MODELS[1]]], results[[MODELS[2]]]), 2)
+
+# Where does the first model go wrong? Rows = experts, columns = model.
+# Top-right cell: the model found a target the experts didn't (false positive).
+# Bottom-left cell: the model missed a target the experts found (false negative).
+table(experts = results$expert_target, model = results[[MODELS[1]]], useNA = "ifany")
+```
+
+**Discuss:** Did you beat the models? Do the models make the same kind of mistake (missing targets,
+or seeing targets that aren't there)? **Back to the big question:** look at `targets_found`. If
+each model read every national policy, would they give the same answer about how many countries
+have concrete targets?
+
+## 5. Read the disagreements
+
+Here are the 10 passages you coded, with your label, the experts' label and both models' labels
+side by side. Passages where anyone disagrees with the experts are marked ⚠️.
+
+```{r disagreements}
+#| results: asis
+# The 10 passages you coded (your labels are in the `me` column, from section 4).
+first10 <- results |> slice(1:10)
+
+# Show a label, or "no answer" if it's missing
+show <- \(x) if (is.na(x)) "no answer" else x
+
+for (i in seq_len(nrow(first10))) {
+  d <- first10[i, ]
+  # Does anyone (you or either model) disagree with the experts on this passage?
+  labels <- c(d$me, d[[MODELS[1]]], d[[MODELS[2]]])
+  flag <- if (any(labels != d$expert_target, na.rm = TRUE)) "⚠️ " else ""
+  cat(flag, "**Passage ", d$id, "** (", d$country, if (d$translated) ", machine-translated", ")  \n",
+      "Experts: ", d$expert_target, " (", d$expert_type, ") · You: ", show(d$me), " · ",
+      MODELS[1], ": ", show(d[[MODELS[1]]]), " · ", MODELS[2], ": ", show(d[[MODELS[2]]]), "\n\n",
+      "> ", d$text, "\n\n", sep = "")
+}
+```
+
+For each ⚠️ passage, decide: **a coding error** (yours or a model's), **an unclear definition**, or
+**the experts got it wrong**? Keep a tally with your partner. How many "errors" are really the
+model's fault? Are the errors
+spread evenly, or concentrated in translated passages?
+
+## 6. ✏️ Change the prompt
+
+Rewrite the definition below. Try loosening it (drop "quantifiable"?), tightening it, or adding an
+example. Then see how many labels change.
+
+```{r new-prompt}
+# ✏️ Edit this definition. Everything else in the prompt stays the same.
+MY_DEFINITION <- "A TARGET is any climate or energy goal the government commits to."
+
+# Ask the first model again about every passage, using your definition (about 1 minute).
+new_labels <- sapply(passages$text, \(t) read_label(ask_model(MODELS[1], make_prompt(t, MY_DEFINITION))))
+
+# Compare with the first model's answers under the original definition.
+cat("Labels that changed:", sum(new_labels != results[[MODELS[1]]], na.rm = TRUE), "of", nrow(passages), "\n")
+cat("Targets found, original prompt:", sum(results[[MODELS[1]]], na.rm = TRUE),
+    "  your prompt:", sum(new_labels, na.rm = TRUE), "\n")
+cat("Kappa vs experts, original prompt:", round(kappa(results[[MODELS[1]]], results$expert_target), 2), "\n")
+cat("Kappa vs experts, your prompt:    ", round(kappa(new_labels, results$expert_target), 2), "\n")
+```
+
+**Discuss:** Did you change the *wording* or the *thing being measured*? If a researcher tried ten
+prompts and reported the best one, what would that do to their findings? **Back to the big
+question:** a government that writes "we aim to decarbonise" has a target under your definition but
+not under the experts'. Whose definition should a study of national commitments use?
+
+## 7. Bonus: same text, different country
+
+One passage, identical wording; only the country name changes. Any difference comes from the model,
+not the text.
+
+```{r country-swap}
+# Take the first passage the experts marked as containing a target.
+passage <- results$text[results$expert_target == 1][1]
+# The countries we'll attribute it to, one at a time.
+countries <- c("Switzerland", "Brazil", "India", "Nigeria", "Indonesia", "United States")
+
+# Ask how likely `country` is to achieve what the passage describes, on a 1-5 scale.
+# Returns NA if the reply isn't a usable number. Same prompt as country_swap_batch.R.
+swap_score <- function(text, country, model = MODELS[1]) {
+  p <- paste0("This passage is from a climate policy published by the government of ", country,
+              ":\n\n", text, "\n\nHow likely is it that ", country,
+              " will achieve this on time? Respond with JSON only: {\"score\": 1 to 5}")
+  s <- tryCatch(as.numeric(fromJSON(ask_model(model, p))$score), error = \(e) NA_real_)
+  if (length(s) != 1 || is.na(s) || s < 1 || s > 5) NA_real_ else s
+}
+# Same passage, six country names, six scores.
+tibble(country = countries, likelihood_1_to_5 = sapply(countries, \(c) swap_score(passage, c)))
+```
+
+One passage tells us little. Does the pattern hold across many passages? If someone has already run
+`country_swap_batch.R` (every suitable target passage, about 300, times six countries), this chunk
+loads those results. Otherwise it runs a small batch of 20 passages here (120 calls, a few minutes).
+
+```{r country-swap-scale}
+# Load the batch results if they exist; otherwise score 20 random passages x 6 countries here.
+if (file.exists("data/country_swap_results.csv")) {
+  swaps <- readr::read_csv("data/country_swap_results.csv", show_col_types = FALSE)
+} else {
+  pool <- readr::read_csv("data/target_pool.csv", show_col_types = FALSE) |> slice_sample(n = 20)
+  swaps <- expand.grid(id = pool$id, country = countries, stringsAsFactors = FALSE) |>
+    left_join(select(pool, id, text), by = "id")
+  swaps$score <- mapply(swap_score, swaps$text, swaps$country)
+}
+cat("Passages:", n_distinct(swaps$id), "\n")
+# swaps now has one row per passage x country, with the model's score in `score`.
+
+# Compare each score with the average for the same passage, so only the country name differs.
+# Example: if a passage gets 4 for Switzerland and its average across countries is 3, Switzerland's
+# shift for that passage is +1. Averaging shifts across passages gives each country's overall shift.
+# se is the standard error; low and high give a 95% confidence interval.
+by_country <- swaps |>
+  group_by(id) |> mutate(shift = score - mean(score, na.rm = TRUE)) |> ungroup() |>
+  group_by(country) |>
+  summarise(n = sum(!is.na(score)), mean_score = mean(score, na.rm = TRUE),
+            se = sd(shift, na.rm = TRUE) / sqrt(n), shift = mean(shift, na.rm = TRUE)) |>
+  mutate(low = shift - 1.96 * se, high = shift + 1.96 * se) |>
+  arrange(shift)
+by_country |> mutate(across(where(is.double), \(x) round(x, 2)))
+
+# For how many passages does the score change at all when only the country name changes?
+varies <- swaps |> group_by(id) |> summarise(v = n_distinct(na.omit(score)) > 1)
+cat("Share of passages where the score changes with the country name:", round(mean(varies$v), 2), "\n")
+```
+
+```{r country-swap-plot}
+#| fig-height: 4
+# Dot = average shift for each country; bars = 95% confidence interval; dashed line = no shift.
+# Countries to the right were scored as more likely to succeed than the same text elsewhere.
+ggplot(by_country, aes(x = shift, y = reorder(country, shift))) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(xmin = low, xmax = high), width = 0.2) +
+  geom_point(size = 2.5) +
+  labs(x = "Score relative to the same passage's average (95% CI)", y = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+**Discuss:** There is no right answer to "how likely is this to be achieved", so this measures the
+model's assumptions, not the countries. **Back to the big question:** if a study used an LLM to
+judge how *credible* or *ambitious* each country's targets are, could regional differences in its
+results come from the model rather than the policies? Would a small validation sample catch that?
+
+## 8. If you have time: ask your own question
+
+So far the experts wrote the codebook. Now you do. Pick a yes/no question about climate policy
+text, write a definition, and test a model on 30 new passages from the Climate Policy Radar data.
+There are **no expert labels** for your question: your own hand-coding is the benchmark.
+
+Some ideas:
+- Does the passage mention **adaptation**, not only emissions cuts?
+- Does it mention **Indigenous peoples or local communities**?
+- Does it set a goal for **nature** (the worked example below)?
+- Does it place responsibility on a **specific actor** (a ministry, industry, cities)?
+
+```{r own-question-setup}
+# 30 passages you haven't seen yet. These have no expert labels.
+more <- readr::read_csv("data/more_passages.csv", show_col_types = FALSE) |> head(30)
+
+# ✏️ Replace the question and definition with your own (or keep this worked example).
+
+MY_QUESTION   <- "Does this passage include a goal or measure for nature?"
+MY_DEFINITION <- "A passage is about NATURE if it sets a goal or describes a measure for forests,
+land use, ecosystems, protected areas or biodiversity. Measures that only mention energy, transport,
+industry or buildings do not count."
+
+# Same idea as make_prompt() and read_label() above, but for your yes/no question.
+ask_yes_no <- function(text, model = MODELS[1]) {
+  prompt <- paste0("You are coding passages from national climate laws and policies.\n\n",
+                   MY_DEFINITION, "\n\nQuestion: ", MY_QUESTION, "\n",
+                   'Respond with JSON only: {"answer": 1} for yes or {"answer": 0} for no.',
+                   "\n\nPassage:\n", text)
+  reply <- ask_model(model, prompt)
+  x <- regmatches(reply, regexpr('"answer"\\s*:\\s*"?[01]', reply))
+  if (length(x) == 0) NA_integer_ else as.integer(substring(x, nchar(x)))
+}
+```
+
+First, code the first 10 passages yourself, using your own definition.
+
+```{r own-question-passages}
+#| results: asis
+# Print the first 10 of the new passages for you to code.
+for (i in 1:10) cat("**", i, ".** ", more$text[i], "\n\n", sep = "")
+```
+
+```{r own-question-labels}
+my_answers <- c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA)   # 1 = yes, 0 = no
+```
+
+Now let the model answer all 30 passages (about 1 minute).
+
+```{r own-question-run}
+# Ask the model your question about all 30 passages.
+more$model_answer <- sapply(more$text, ask_yes_no)
+
+# On the 10 you coded, how well does the model agree with you?
+
+cat("Model vs you, first 10 passages: kappa =",
+    round(kappa(more$model_answer[1:10], my_answers), 2), "\n")
+cat("Model said yes to", sum(more$model_answer, na.rm = TRUE), "of", nrow(more), "passages\n\n")
+```
+
+Read what the model said yes to on the 20 passages you didn't code. Do you agree?
+
+```{r own-question-check}
+#| results: asis
+# Print the passages (among the 20 you didn't code) where the model answered yes.
+yes <- more |> slice(11:30) |> filter(model_answer == 1)
+for (i in seq_len(nrow(yes))) cat("**", yes$country[i], "** ", yes$text[i], "\n\n", sep = "")
+```
+
+**Discuss:** How hard was it to write a definition you could apply consistently? Would a
+classmate code your 10 passages the same way? Is a 10-passage benchmark enough, and where does
+your question sit on the risk ladder?
+
+## 9. From this sample to a whole corpus
+
+Suppose a model performed well on everything above. Climate Policy Radar also publishes the
+[full text of its database](https://huggingface.co/datasets/ClimatePolicyRadar/all-document-text-data):
+tens of millions of text passages from national climate laws, policies and UNFCCC submissions.
+
+If you want to look at it, the bonus notebook `bonus_cloud_native.qmd` queries the whole corpus in
+place, without downloading it, and draws a random sample of passages the experts never labelled.
+
+Write short answers with a partner, directly in this notebook:
+
+1. **Your question.** What would you ask of the whole corpus? It can be the big question from the
+   top of this notebook, or something else (for example: have targets become more specific over
+   time? how often do climate laws set goals for nature? which countries' NDCs are conditional on
+   finance?).
+
+   *Your answer:*
+
+2. **What the model would need to do.** Which labels or extracted values would it produce, and
+   how would you turn them into an answer (counts by country, trends over time, ...)?
+
+   *Your answer:*
+
+3. **What you would check first.** Today you validated on 100 passages chosen for convenience.
+   Before trusting results across the corpus, what else would you need? Think about which
+   countries and languages the corpus covers, whether the metadata (country, date) is right,
+   whether accuracy holds for translated text and for each region, and who should help write the
+   definition.
+
+   *Your answer:*
+
+4. **Risk.** Where does your question sit on Lan et al.'s risk ladder (Table 2), and what would
+   change if a government or funder used your results?
+
+   *Your answer:*
+
+## Before you leave
+
+1. Where would today's task sit on Lan et al.'s risk ladder (Table 2)? What checking would it need
+   before the labels could be published?
+2. The expert labels came from one organisation, and many passages were machine-translated before
+   the experts read them. What does that mean for "ground truth"?
+3. When would *not* using an LLM be the more rigorous choice?
